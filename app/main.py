@@ -3,10 +3,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
-import random
+import random, threading, time
 from .iq_client import IQClient, IQConnectionError
 
-app = FastAPI(title="AI Trader Hub API", version="8.0.0")
+app = FastAPI(title="AI Trader Hub API", version="9.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 IQ = IQClient()
@@ -22,19 +22,25 @@ STATE = {
     "trades": [],
     "logs": [],
     "last_analysis": None,
+    "next_action": "Aguardando login.",
+    "worker_running": False,
     "config": {
-        "daily_goal": 0.0,
-        "entry_value": 2.0,
-        "stop_loss": 0.0,
-        "stop_gain": 0.0,
-        "max_operations": 20,
-        "max_losses": 3,
-        "start_time": "08:00",
-        "end_time": "18:00",
-        "min_confidence": 75,
-        "mode": "Balanceado"
+        "daily_goal": 1000.0,
+        "entry_value": 12.0,
+        "stop_loss": 120.0,
+        "stop_gain": 1000.0,
+        "max_operations": 200,
+        "max_losses": 4,
+        "start_time": "00:00",
+        "end_time": "23:59",
+        "min_confidence": 72,
+        "mode": "Contínuo DEMO",
+        "expiration_minutes": 1,
+        "trade_interval_seconds": 10,
+        "execute_real_demo_orders": True
     }
 }
+LOCK = threading.Lock()
 
 class LoginPayload(BaseModel):
     email: str
@@ -46,17 +52,23 @@ class ConfigPayload(BaseModel):
     entry_value: float = Field(gt=0)
     stop_loss: float = Field(ge=0)
     stop_gain: float = Field(ge=0)
-    max_operations: int = Field(ge=1, le=300)
-    max_losses: int = Field(ge=1, le=30)
+    max_operations: int = Field(ge=1, le=1000)
+    max_losses: int = Field(ge=1, le=50)
     start_time: str
     end_time: str
     min_confidence: int = Field(ge=50, le=98)
-    mode: str = "Balanceado"
+    mode: str = "Contínuo DEMO"
+    expiration_minutes: int = Field(default=1, ge=1, le=15)
+    trade_interval_seconds: int = Field(default=10, ge=5, le=3600)
+    execute_real_demo_orders: bool = True
+
+def now(): return datetime.now().strftime("%H:%M:%S")
 
 def log(msg: str):
-    item = {"time": datetime.now().strftime("%H:%M:%S"), "message": msg}
-    STATE["logs"].insert(0, item)
-    STATE["logs"] = STATE["logs"][:100]
+    with LOCK:
+        STATE["logs"].insert(0, {"time": now(), "message": msg})
+        STATE["logs"] = STATE["logs"][:200]
+        STATE["next_action"] = msg
 
 def fake_candles(asset: str, points: int = 80):
     base = 156.20 if asset == "USD/JPY" else 1.0840
@@ -73,10 +85,9 @@ def fake_candles(asset: str, points: int = 80):
 def get_candles_safe(asset: str):
     if IQ.connected:
         try:
-            log(f"Buscando candles reais {asset} na IQ Option.")
-            return IQ.candles(asset, 60, 80), True
+            return IQ.candles(asset, 60, 90), True
         except Exception as exc:
-            log(f"Candles reais falharam: {exc}. Usando candles visuais simulados.")
+            log(f"Falha ao buscar candles reais {asset}: {exc}")
     return fake_candles(asset), False
 
 def analyze(asset: str):
@@ -86,62 +97,91 @@ def analyze(asset: str):
         return {"asset": asset, "action": "AGUARDAR", "confidence": 0, "trend": "SEM DADOS", "best_time": "--", "candles_real": real, "reasons": ["Sem candles suficientes"]}
     ma9 = sum(closes[-9:]) / 9
     ma21 = sum(closes[-21:]) / 21
-    trend = "ALTA" if ma9 > ma21 else "BAIXA" if ma9 < ma21 else "LATERAL"
+    change = closes[-1] - closes[-21]
+    trend = "ALTA" if ma9 > ma21 and change > 0 else "BAIXA" if ma9 < ma21 and change < 0 else "LATERAL"
     rsi = random.randint(42, 72)
-    confidence = 45 + (18 if trend != "LATERAL" else 0) + (12 if 45 <= rsi <= 68 else 0) + random.randint(0, 18)
-    confidence = min(92, max(45, confidence))
+    confidence = 44 + (22 if trend != "LATERAL" else 0) + (12 if 45 <= rsi <= 68 else 0) + random.randint(0, 16)
+    confidence = min(94, max(45, confidence))
     min_conf = STATE["config"]["min_confidence"]
     action = "CALL" if trend == "ALTA" and confidence >= min_conf else "PUT" if trend == "BAIXA" and confidence >= min_conf else "AGUARDAR"
-    best_time = random.choice(["09:00-10:30", "10:30-12:00", "14:00-16:00", "15:00-17:00"])
-    return {"asset": asset, "action": action, "confidence": confidence, "trend": trend, "rsi": rsi, "best_time": best_time, "candles_real": real, "candles": cs, "reasons": [f"Tendência {trend}", f"RSI {rsi}", "Médias móveis 9/21", "Motor de risco ativo"]}
+    return {"asset": asset, "action": action, "confidence": confidence, "trend": trend, "rsi": rsi, "best_time": "AGORA" if action != "AGUARDAR" else "Aguardar", "candles_real": real, "candles": cs, "reasons": [f"Tendência {trend}", f"RSI {rsi}", "Médias 9/21", "Ciclo contínuo DEMO"]}
 
 def current_balance() -> float:
-    if not IQ.connected:
-        return 0.0
-    return IQ.balance()
+    return IQ.balance() if IQ.connected else 0.0
 
 def risk_ok(a):
     cfg = STATE["config"]
-    now = datetime.now().strftime("%H:%M")
+    current = datetime.now().strftime("%H:%M")
     if not IQ.connected: return False, "IQ Option não conectada"
     if STATE["robot"] != "running": return False, "Robô não está executando"
-    if cfg["daily_goal"] and STATE["daily_profit"] >= cfg["daily_goal"]: return False, "Meta diária atingida"
+    if cfg["daily_goal"] and STATE["daily_profit"] >= cfg["daily_goal"]: return False, "Meta diária atingida: robô pausou para proteger o resultado"
     if cfg["stop_gain"] and STATE["daily_profit"] >= cfg["stop_gain"]: return False, "Stop gain atingido"
     if cfg["stop_loss"] and STATE["daily_profit"] <= -cfg["stop_loss"]: return False, "Stop loss atingido"
     if STATE["operations"] >= cfg["max_operations"]: return False, "Limite de operações atingido"
     if STATE["loss_streak"] >= cfg["max_losses"]: return False, "Limite de perdas seguidas atingido"
-    if not (cfg["start_time"] <= now <= cfg["end_time"]): return False, "Fora do horário configurado"
-    if a["action"] == "AGUARDAR": return False, "IA aguardando oportunidade melhor"
-    return True, "Aprovado pelo risco"
+    if not (cfg["start_time"] <= current <= cfg["end_time"]): return False, "Fora do horário configurado"
+    if a["action"] == "AGUARDAR": return False, "IA aguardando sinal melhor"
+    return True, "Aprovado para entrada DEMO"
 
-def maybe_trade():
-    if not IQ.connected or STATE["robot"] != "running":
+def pick_best_market():
+    analyses = [analyze(asset) for asset in ASSETS]
+    analyses.sort(key=lambda x: x["confidence"], reverse=True)
+    return analyses[0], analyses
+
+def execute_one_cycle():
+    best, all_analyses = pick_best_market()
+    STATE["last_analysis"] = best
+    ok, reason = risk_ok(best)
+    log(f"IA escolheu {best['asset']}: {best['action']} {best['confidence']}% — {reason}")
+    if not ok:
         return
-    asset = random.choice(ASSETS)
-    a = analyze(asset)
-    STATE["last_analysis"] = a
-    ok, reason = risk_ok(a)
-    log(f"IA analisou {asset}: {a['action']} {a['confidence']}% — {reason}")
-    # Segurança: esta versão registra operação SIMULADA. Execução real precisa endpoint separado e confirmação explícita.
-    if not ok or random.random() > 0.35:
-        return
-    amount = STATE["config"]["entry_value"]
-    result = "WIN" if random.random() < (a["confidence"] / 115) else "LOSS"
-    profit = round(amount * 0.89, 2) if result == "WIN" else -amount
-    STATE["operations"] += 1
-    if result == "WIN": STATE["wins"] += 1; STATE["loss_streak"] = 0
-    else: STATE["losses"] += 1; STATE["loss_streak"] += 1
-    # saldo real vem da IQ; daily_profit usa resultado simulado até execução real ser implementada
-    STATE["daily_profit"] = round(STATE["daily_profit"] + profit, 2)
-    trade = {"time": datetime.now().strftime("%H:%M:%S"), "asset": asset, "direction": a["action"], "amount": amount, "result": result, "profit": profit, "confidence": a["confidence"], "strategy": "IA + risco", "reason": "Operação simulada registrada; saldo real vem da IQ Option"}
-    STATE["trades"].insert(0, trade); STATE["trades"] = STATE["trades"][:50]
-    log(f"Operação SIMULADA {a['action']} {asset}: {result} {profit:+.2f}")
+    amount = float(STATE["config"]["entry_value"])
+    exp = int(STATE["config"].get("expiration_minutes", 1))
+    if STATE["config"].get("execute_real_demo_orders", True):
+        sent = IQ.buy_demo_binary(best["asset"], best["action"], amount, exp)
+        log(f"Ordem DEMO enviada: {sent['direction']} {sent['asset']} R$ {amount:.2f} exp {exp}m ID {sent['order_id']}")
+        result = IQ.wait_result(sent["order_id"], exp)
+        profit = float(result["profit"])
+        result_name = result["result"]
+    else:
+        log("Modo teste: ordem não enviada, apenas simulação local.")
+        time.sleep(max(5, exp*60))
+        result_name = "WIN" if random.random() < (best["confidence"] / 115) else "LOSS"
+        profit = round(amount * 0.89, 2) if result_name == "WIN" else -amount
+    with LOCK:
+        STATE["operations"] += 1
+        if result_name == "WIN": STATE["wins"] += 1; STATE["loss_streak"] = 0
+        elif result_name == "LOSS": STATE["losses"] += 1; STATE["loss_streak"] += 1
+        STATE["daily_profit"] = round(STATE["daily_profit"] + profit, 2)
+        trade = {"time": now(), "asset": best["asset"], "direction": best["action"], "amount": amount, "result": result_name, "profit": round(profit,2), "confidence": best["confidence"], "strategy": "Ciclo contínuo IA", "reason": "Entrada DEMO real enviada na IQ Option" if STATE["config"].get("execute_real_demo_orders", True) else "Simulação local"}
+        STATE["trades"].insert(0, trade); STATE["trades"] = STATE["trades"][:100]
+    log(f"Resultado {result_name} {best['asset']}: {profit:+.2f}. Lucro do dia: {STATE['daily_profit']:+.2f}")
+    if STATE["config"]["daily_goal"] and STATE["daily_profit"] >= STATE["config"]["daily_goal"]:
+        STATE["robot"] = "paused"
+        log("Meta atingida. Robô pausado automaticamente.")
+
+def worker_loop():
+    STATE["worker_running"] = True
+    log("Motor contínuo iniciado: analisando e operando até meta/stop/pausa.")
+    while STATE["robot"] == "running":
+        try:
+            execute_one_cycle()
+        except Exception as exc:
+            log(f"Erro no ciclo: {exc}")
+        time.sleep(int(STATE["config"].get("trade_interval_seconds", 10)))
+    STATE["worker_running"] = False
+    log("Motor contínuo parado.")
+
+def ensure_worker():
+    if not STATE["worker_running"]:
+        t = threading.Thread(target=worker_loop, daemon=True)
+        t.start()
 
 @app.get("/")
-def root(): return {"ok": True, "name": "AI Trader Hub", "version": "8.0.0"}
+def root(): return {"ok": True, "name": "AI Trader Hub", "version": "9.0.0"}
 
 @app.get("/api/health")
-def health(): return {"api_online": True, "iq_connected": IQ.connected, "robot": STATE["robot"], "version": "8.0.0"}
+def health(): return {"api_online": True, "iq_connected": IQ.connected, "robot": STATE["robot"], "worker_running": STATE["worker_running"], "version": "9.0.0"}
 
 @app.post("/api/iq/login")
 def iq_login(p: LoginPayload):
@@ -149,7 +189,7 @@ def iq_login(p: LoginPayload):
         data = IQ.connect(p.email, p.password, p.account_type)
         STATE["initial_balance"] = data["balance"]
         STATE["daily_profit"] = 0.0
-        log(f"IQ Option conectada em {data['account_type']}. Saldo real DEMO: {data['balance']:.2f}")
+        log(f"IQ Option conectada em PRACTICE. Saldo DEMO real: {data['balance']:.2f}")
         return {"connected": True, "balance": data["balance"], "currency": "BRL", "account_type": data["account_type"], "message": "IQ Option conectada. Saldo DEMO real carregado."}
     except IQConnectionError as exc:
         log(f"Falha no login IQ: {exc}")
@@ -162,8 +202,7 @@ def iq_logout():
 
 @app.get("/api/iq/status")
 def iq_status():
-    bal = 0.0
-    err = ""
+    bal = 0.0; err = ""
     if IQ.connected:
         try: bal = IQ.balance()
         except Exception as exc: err = str(exc)
@@ -180,8 +219,9 @@ def save_config(p: ConfigPayload):
 @app.post("/api/robot/start")
 def robot_start():
     if not IQ.connected: raise HTTPException(400, "Conecte na IQ Option antes de iniciar o robô.")
-    STATE["robot"] = "running"; log("Robô iniciado. IA começou a analisar o mercado.")
-    return {"robot": "running"}
+    STATE["robot"] = "running"
+    ensure_worker()
+    return {"robot": "running", "message": "Robô contínuo iniciado em DEMO."}
 
 @app.post("/api/robot/pause")
 def robot_pause(): STATE["robot"] = "paused"; log("Robô pausado."); return {"robot": "paused"}
@@ -190,9 +230,7 @@ def robot_stop(): STATE["robot"] = "stopped"; log("Robô parado."); return {"rob
 
 @app.get("/api/dashboard")
 def dashboard():
-    maybe_trade()
-    bal = 0.0
-    balance_error = ""
+    bal = 0.0; balance_error = ""
     if IQ.connected:
         try: bal = current_balance()
         except Exception as exc: balance_error = str(exc)
@@ -207,7 +245,7 @@ def dashboard():
     goal = cfg["daily_goal"]
     goal_pct = min(100, round(max(0, STATE["daily_profit"]) / goal * 100)) if goal else 0
     return {
-        "cards": {"api_online": True, "iq_connected": IQ.connected, "robot": STATE["robot"], "account_type": IQ.account_type, "currency": "BRL", "initial_balance": STATE["initial_balance"] if IQ.connected else 0, "current_balance": bal if IQ.connected else 0, "daily_profit": STATE["daily_profit"] if IQ.connected else 0, "daily_goal": goal, "goal_pct": goal_pct, "win_rate": win_rate, "last_sync": IQ.last_sync, "balance_error": balance_error},
+        "cards": {"api_online": True, "iq_connected": IQ.connected, "robot": STATE["robot"], "worker_running": STATE["worker_running"], "account_type": IQ.account_type, "currency": "BRL", "initial_balance": STATE["initial_balance"] if IQ.connected else 0, "current_balance": bal if IQ.connected else 0, "daily_profit": STATE["daily_profit"] if IQ.connected else 0, "daily_goal": goal, "goal_pct": goal_pct, "win_rate": win_rate, "last_sync": IQ.last_sync, "balance_error": balance_error, "next_action": STATE["next_action"]},
         "stats": {"operations": ops, "wins": STATE["wins"], "losses": STATE["losses"], "loss_streak": STATE["loss_streak"]},
         "performance": {"labels": ["08h", "10h", "12h", "14h", "16h", "18h"], "net": [0, 0, round(STATE["daily_profit"]*.25,2), round(STATE["daily_profit"]*.55,2), STATE["daily_profit"], STATE["daily_profit"]], "losses": [0, 0, -STATE["losses"]*2, -STATE["losses"]*2, 0, 0]},
         "opportunities": analyses,
