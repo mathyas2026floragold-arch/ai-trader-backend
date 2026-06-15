@@ -1,0 +1,34 @@
+O comando AT foi preterido. Use schtasks.exe em seu lugar.
+
+Comando inv†lido.
+
+O comando AT agenda a execuá∆o de comandos e programas em um computador,
+de acordo com as datas e horas especificadas. O serviáo de agendamento deve
+estar sendo executado para que o comando AT possa ser usado.
+
+AT [\\computador] [ [id] [/DELETE] | /DELETE [/YES]]
+AT [\\computador] hora [/INTERACTIVE]
+   [ /EVERY:data[,...] | /NEXT:data[,...]] "comando"
+
+\\computador        Especifica um computador remoto. Os comandos s∆o
+                    agendados no computador local se este parÉm. for omitido.
+id                  N£mero de identificaá∆o atribu°do a um comando
+                    agendado.
+/DELETE             Cancela um comando agendado. Se a identificaá∆o for
+                    omitida, todos os comandos agendados no computador s∆o
+                    cancelados.
+/YES                Usado com o comando para cancelar todos os trabalhos
+                    quando nenhuma confirmaá∆o adicional for necess†ria.
+hora                Especifica o hor†rio em que o comando deve ser executado.
+/INTERACTIVE        Permite que o trabalho interaja com a †rea de trabalho
+                    do usu†rio que estiver conectado quando o trabalho
+                    estiver sendo executado.
+/EVERY:data[,...]   Executa o comando especificado em cada dia da semana
+                    ou do màs especificado. Se a data for omitida, ser†
+                    usada a data corrente.
+/NEXT:data[,...]    Executa o comando especificado na pr¢xima ocorrància do
+                    dia (por exemplo, na pr¢xima quinta-feira). Se a data
+                    for omitida, ser† usada a data corrente.
+"comando"           Comando do Windows NT ou do programa em lotes a ser
+                    executado.
+
