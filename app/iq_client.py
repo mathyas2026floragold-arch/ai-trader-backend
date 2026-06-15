@@ -6,6 +6,9 @@ import time
 class IQConnectionError(Exception):
     pass
 
+NORMAL_ASSETS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD"]
+OTC_ASSETS = ["EUR/USD OTC", "GBP/USD OTC", "USD/JPY OTC", "AUD/USD OTC", "USD/CAD OTC", "EUR/GBP OTC"]
+
 class IQClient:
     def __init__(self) -> None:
         self.api: Optional[Any] = None
@@ -54,8 +57,7 @@ class IQClient:
         self.last_sync = datetime.now().strftime("%H:%M:%S")
 
     def balance(self) -> float:
-        if not self.connected or not self.api:
-            raise IQConnectionError("IQ Option não conectada.")
+        self._require()
         try:
             bal = float(self.api.get_balance())
             self.last_sync = datetime.now().strftime("%H:%M:%S")
@@ -65,11 +67,27 @@ class IQClient:
             self.last_error = str(exc)
             raise IQConnectionError(f"Falha ao atualizar saldo: {exc}") from exc
 
-    def candles(self, asset: str, interval: int = 60, count: int = 80) -> list[dict]:
+    def _require(self) -> None:
         if not self.connected or not self.api:
             raise IQConnectionError("IQ Option não conectada.")
+
+    def to_iq_active(self, asset: str) -> str:
+        s = asset.upper().strip().replace(" ", "")
+        otc = s.endswith("OTC") or "-OTC" in s
+        s = s.replace("OTC", "").replace("/", "").replace("-", "")
+        return f"{s}-OTC" if otc else s
+
+    def display_asset(self, iq_active: str) -> str:
+        otc = iq_active.endswith("-OTC")
+        raw = iq_active.replace("-OTC", "")
+        pairs = {"EURUSD":"EUR/USD", "GBPUSD":"GBP/USD", "USDJPY":"USD/JPY", "AUDUSD":"AUD/USD", "USDCAD":"USD/CAD", "EURGBP":"EUR/GBP"}
+        disp = pairs.get(raw, raw)
+        return disp + (" OTC" if otc else "")
+
+    def candles(self, asset: str, interval: int = 60, count: int = 80) -> list[dict]:
+        self._require()
         try:
-            active = asset.replace("/", "")
+            active = self.to_iq_active(asset)
             raw = self.api.get_candles(active, interval, count, time.time())
             out = []
             for c in raw or []:
@@ -85,40 +103,94 @@ class IQClient:
         except Exception as exc:
             raise IQConnectionError(f"Falha ao buscar candles de {asset}: {exc}") from exc
 
-    def buy_demo_binary(self, asset: str, direction: str, amount: float, expiration_minutes: int = 1) -> dict:
-        """Envia ordem na conta PRACTICE. REAL fica bloqueado pelo connect()."""
-        if not self.connected or not self.api:
-            raise IQConnectionError("IQ Option não conectada.")
-        active = asset.replace("/", "")
+    def open_times(self) -> dict:
+        self._require()
+        try:
+            data = self.api.get_all_open_time()
+            return data or {}
+        except Exception as exc:
+            self.last_error = str(exc)
+            return {}
+
+    def is_open(self, asset: str, market: str, expiration_minutes: int = 1) -> bool:
+        """market: binary, digital, otc. OTC valida o ativo OTC no mapa de binary/turbo/digital."""
+        active = self.to_iq_active(asset)
+        data = self.open_times()
+        if not data:
+            return True  # se API não informar abertura, deixa tentar e captura erro real
+        markets = []
+        if market == "digital": markets = ["digital"]
+        elif market == "binary": markets = ["turbo" if expiration_minutes <= 5 else "binary", "binary", "turbo"]
+        elif market == "otc": markets = ["digital", "turbo", "binary"]
+        else: markets = ["digital", "turbo", "binary"]
+        for m in markets:
+            try:
+                if data.get(m, {}).get(active, {}).get("open"):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def available_candidates(self, assets: list[str], market_type: str, expiration_minutes: int = 1) -> list[dict]:
+        """Retorna candidatos abertos e na ordem de prioridade configurada."""
+        mt = market_type.upper().strip()
+        candidates: list[dict] = []
+        for asset in assets:
+            if mt == "BINARY":
+                candidates.append({"asset": asset, "market": "binary", "label": "Binary"})
+            elif mt == "DIGITAL":
+                candidates.append({"asset": asset, "market": "digital", "label": "Digital"})
+            elif mt == "OTC":
+                otc_asset = asset if "OTC" in asset.upper() else asset + " OTC"
+                # tenta digital OTC primeiro e depois binary/turbo OTC
+                candidates.append({"asset": otc_asset, "market": "digital", "label": "Digital OTC"})
+                candidates.append({"asset": otc_asset, "market": "binary", "label": "Binary OTC"})
+            else:  # AUTO
+                candidates.append({"asset": asset, "market": "digital", "label": "Digital"})
+                candidates.append({"asset": asset, "market": "binary", "label": "Binary"})
+                otc_asset = asset + " OTC" if "OTC" not in asset.upper() else asset
+                candidates.append({"asset": otc_asset, "market": "digital", "label": "Digital OTC"})
+                candidates.append({"asset": otc_asset, "market": "binary", "label": "Binary OTC"})
+        open_candidates = [c for c in candidates if self.is_open(c["asset"], "otc" if "OTC" in c["asset"].upper() else c["market"], expiration_minutes)]
+        return open_candidates or candidates
+
+    def buy_demo(self, asset: str, direction: str, amount: float, expiration_minutes: int = 1, market: str = "binary") -> dict:
+        self._require()
         action = direction.lower().strip()
         if action not in ["call", "put"]:
             raise IQConnectionError("Direção inválida. Use CALL ou PUT.")
+        active = self.to_iq_active(asset)
         try:
-            check, order_id = self.api.buy(float(amount), active, action, int(expiration_minutes))
+            if market == "digital":
+                if not hasattr(self.api, "buy_digital_spot_v2"):
+                    raise IQConnectionError("Esta versão da iqoptionapi não possui buy_digital_spot_v2.")
+                check, order_id = self.api.buy_digital_spot_v2(active, float(amount), action, int(expiration_minutes))
+            else:
+                check, order_id = self.api.buy(float(amount), active, action, int(expiration_minutes))
             if not check:
                 raise IQConnectionError(f"IQ Option recusou a ordem: {order_id}")
             self.last_sync = datetime.now().strftime("%H:%M:%S")
-            return {"sent": True, "order_id": order_id, "asset": asset, "direction": action.upper(), "amount": amount, "expiration_minutes": expiration_minutes}
+            return {"sent": True, "order_id": order_id, "asset": self.display_asset(active), "iq_active": active, "market": market, "direction": action.upper(), "amount": amount, "expiration_minutes": expiration_minutes}
         except IQConnectionError:
             raise
         except Exception as exc:
             raise IQConnectionError(f"Falha ao enviar ordem IQ Option: {exc}") from exc
 
-    def wait_result(self, order_id: Any, expiration_minutes: int = 1) -> dict:
-        if not self.connected or not self.api:
-            raise IQConnectionError("IQ Option não conectada.")
+    def wait_result(self, order_id: Any, expiration_minutes: int = 1, market: str = "binary") -> dict:
+        self._require()
         time.sleep(max(5, int(expiration_minutes) * 60 + 3))
         profit = None
         raw = None
         try:
-            if hasattr(self.api, "check_win_v4"):
+            if market == "digital" and hasattr(self.api, "check_win_digital_v2"):
+                raw = self.api.check_win_digital_v2(order_id)
+            elif hasattr(self.api, "check_win_v4"):
                 raw = self.api.check_win_v4(order_id)
             elif hasattr(self.api, "check_win_v3"):
                 raw = self.api.check_win_v3(order_id)
             else:
                 raw = self.api.check_win_v2(order_id)
             if isinstance(raw, tuple):
-                # Algumas versões retornam (status, lucro) ou (id, lucro)
                 profit = float(raw[-1])
             else:
                 profit = float(raw)
