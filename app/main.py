@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import random, threading, time
 from .iq_client import IQClient, IQConnectionError
 
-app = FastAPI(title="AI Trader Hub API", version="10.0.0")
+app = FastAPI(title="AI Trader Hub API", version="11.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 IQ = IQClient()
@@ -221,10 +221,10 @@ def ensure_worker():
         t.start()
 
 @app.get("/")
-def root(): return {"ok": True, "name": "AI Trader Hub", "version": "10.0.0"}
+def root(): return {"ok": True, "name": "AI Trader Hub", "version": "11.0.0"}
 
 @app.get("/api/health")
-def health(): return {"api_online": True, "iq_connected": IQ.connected, "robot": STATE["robot"], "worker_running": STATE["worker_running"], "version": "10.0.0"}
+def health(): return {"api_online": True, "iq_connected": IQ.connected, "robot": STATE["robot"], "worker_running": STATE["worker_running"], "version": "11.0.0"}
 
 @app.post("/api/iq/login")
 def iq_login(p: LoginPayload):
@@ -263,8 +263,9 @@ def save_config(p: ConfigPayload):
 def robot_start():
     if not IQ.connected: raise HTTPException(400, "Conecte na IQ Option antes de iniciar o robô.")
     STATE["robot"] = "running"
+    log("Comando recebido: iniciar robô. Preparando ciclo operacional.")
     ensure_worker()
-    return {"robot": "running", "message": "Robô contínuo iniciado em DEMO."}
+    return {"robot": "running", "worker_running": STATE["worker_running"], "message": "Robô contínuo iniciado em DEMO."}
 
 @app.post("/api/robot/pause")
 def robot_pause(): STATE["robot"] = "paused"; log("Robô pausado."); return {"robot": "paused"}
